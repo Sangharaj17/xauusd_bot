@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class XAUUSDSignalGenerator:
     """Main class for generating XAUUSD trading signals in JSON format"""
     
-    def __init__(self, alpha_vantage_key: str = "demo", mode: str = "standard", telegram_token: Optional[str] = None, telegram_chat_id: Optional[str] = None, notify_no_signal: bool = True):
+    def __init__(self, alpha_vantage_key: str = "demo", mode: str = "standard", telegram_token: Optional[str] = None, telegram_chat_id: Optional[str] = None):
         self.alpha_vantage_key = alpha_vantage_key
         self.tp_pips = 40
         self.sl_pips = 60
@@ -30,7 +30,6 @@ class XAUUSDSignalGenerator:
         # Telegram (direct-only, no env fallback)
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
-        self.notify_no_signal = notify_no_signal
     
     def fetch_market_data(self, symbol: str = "GC=F", interval: str = "5m") -> pd.DataFrame:
         """Fetch OHLC data from Yahoo Finance"""
@@ -531,7 +530,7 @@ class XAUUSDSignalGenerator:
             direction = decision.get('direction')
 
             if direction is None:
-                no_sig = {
+                return {
                     'status': 'no_signal',
                     'reason': 'No clear trading opportunity detected',
                     'timestamp': datetime.now(UTC).isoformat().replace('+00:00','Z'),
@@ -545,14 +544,6 @@ class XAUUSDSignalGenerator:
                         }
                     }
                 }
-                # Optional Telegram notify even on no-signal
-                try:
-                    if self.notify_no_signal and self.telegram_token and self.telegram_chat_id:
-                        msg = self._format_no_signal_text(no_sig)
-                        self.send_telegram_message(msg)
-                except Exception:
-                    pass
-                return no_sig
             
             # Calculate entry, TP, SL
             entry_price = m5['price']
@@ -726,21 +717,6 @@ class XAUUSDSignalGenerator:
             f"Mode: {mode}\n"
             f"Tech: {tech}\n"
             f"MTF: {mtf}"
-        )
-
-    def _format_no_signal_text(self, payload: Dict) -> str:
-        analysis = payload.get('analysis', {})
-        m5_signals = analysis.get('m5_signals', [])
-        m15_trend = analysis.get('m15_trend', 'neutral')
-        sentiment = analysis.get('sentiment', 'neutral')
-        scores = analysis.get('scores', {})
-        return (
-            "XAUUSD No Signal\n"
-            f"Reason: {payload.get('reason')}\n"
-            f"M5: {', '.join(m5_signals) if m5_signals else 'none'}\n"
-            f"M15 trend: {m15_trend}\n"
-            f"Sentiment: {sentiment}\n"
-            f"Scores B/B: {scores.get('bullish')}/{scores.get('bearish')}"
         )
 
     def send_telegram_message(self, text: str) -> bool:
@@ -960,9 +936,6 @@ def main():
     parser.add_argument('--symbol', default='GC=F')
     parser.add_argument('--telegram-token', default=None, help='Telegram bot token')
     parser.add_argument('--telegram-chat-id', default=None, help='Telegram chat/channel id (e.g., -1001234567890)')
-    parser.add_argument('--schedule-count', type=int, default=5, help='Signals per day when using schedule action')
-    parser.add_argument('--schedule-start-utc', type=int, default=9, help='Start hour UTC for scheduling window (0-23)')
-    parser.add_argument('--schedule-end-utc', type=int, default=21, help='End hour UTC for scheduling window (0-23)')
     parser.add_argument('--start', default=None, help='ISO e.g. 2024-01-01T00:00:00Z')
     parser.add_argument('--end', default=None, help='ISO e.g. 2024-03-01T00:00:00Z')
     args = parser.parse_args()
@@ -983,48 +956,6 @@ def main():
         signal = generator.generate_signal()
         print(json.dumps(signal, indent=2))
         return
-
-    if args.action == 'schedule':
-        # Build evenly spaced times between start and end (UTC)
-        from time import sleep
-        def build_schedule_for_day(day_utc: datetime) -> List[datetime]:
-            start_hour = max(0, min(23, args.schedule_start_utc))
-            end_hour = max(0, min(23, args.schedule_end_utc))
-            if end_hour <= start_hour:
-                # Ensure end is after start; default to +12h window
-                end_hour = (start_hour + 12) % 24
-            start_dt = day_utc.replace(hour=start_hour, minute=0, second=0, microsecond=0)
-            end_dt = day_utc.replace(hour=end_hour, minute=0, second=0, microsecond=0)
-            # If end is before start because of modulo wrap, push to next day
-            if end_dt <= start_dt:
-                end_dt = end_dt + timedelta(days=1)
-            total_seconds = (end_dt - start_dt).total_seconds()
-            count = max(1, args.schedule_count)
-            # Place triggers at equal intervals within (start_dt, end_dt)
-            interval = total_seconds / (count + 1)
-            times = [start_dt + timedelta(seconds=interval * (i + 1)) for i in range(count)]
-            return times
-
-        current_day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        schedule_times = build_schedule_for_day(current_day)
-        sent_today = 0
-        while True:
-            now = datetime.now(UTC)
-            # New day rollover
-            if now.date() != current_day.date():
-                current_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                schedule_times = build_schedule_for_day(current_day)
-                sent_today = 0
-            # Fire any due signals
-            while schedule_times and now >= schedule_times[0]:
-                sig = generator.generate_signal()
-                print(json.dumps(sig, indent=2))
-                sent_today += 1
-                schedule_times.pop(0)
-            # Sleep a short interval
-            sleep(15)
-        # unreachable
-        
 
     # Backtest/optimize need historical data
     if args.start and args.end:
