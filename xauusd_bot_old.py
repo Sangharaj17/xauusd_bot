@@ -11,15 +11,191 @@ import numpy as np
 from typing import Dict, List, Optional, Union
 import logging
 import argparse
+from supabase import create_client, Client
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class SupabaseSignalStorage:
+    """Handles storing and retrieving signals from Supabase"""
+    
+    def __init__(self, supabase_url: str, supabase_key: str):
+        """
+        Initialize Supabase client
+        
+        Args:
+            supabase_url: Your Supabase project URL
+            supabase_key: Your Supabase anon/service key
+        """
+        try:
+            self.client: Client = create_client(supabase_url, supabase_key)
+            logger.info("Supabase client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase client: {e}")
+            raise
+    
+    def save_signal(self, signal: Dict, telegram_sent: bool = False) -> Optional[Dict]:
+        """
+        Save a trading signal to Supabase
+        
+        Args:
+            signal: The signal dictionary from generator
+            telegram_sent: Whether the signal was successfully sent to Telegram
+            
+        Returns:
+            The inserted record or None if failed
+        """
+        try:
+            # Prepare data for insertion
+            record = {
+                'pair': signal.get('pair', 'XAUUSD'),
+                'signal_time': signal.get('time'),
+                'direction': signal.get('direction'),
+                'entry_price': signal.get('entry_price'),
+                'take_profit': signal.get('take_profit'),
+                'stop_loss': signal.get('stop_loss'),
+                'confidence': signal.get('confidence'),
+                'status': signal.get('status', 'active'),
+                'mode': signal.get('mode', 'standard'),
+                'telegram_sent': telegram_sent,
+                'reasoning_technical': signal.get('reasoning', {}).get('technical'),
+                'reasoning_fundamental': signal.get('reasoning', {}).get('fundamental'),
+                'reasoning_mtf': signal.get('reasoning', {}).get('multi_timeframe'),
+                'notes': signal.get('notes'),
+                'created_at': datetime.now(UTC).isoformat()
+            }
+            
+            # Insert into Supabase
+            response = self.client.table('signal_history').insert(record).execute()
+            
+            if response.data:
+                logger.info(f"Signal saved to Supabase: ID {response.data[0].get('id')}")
+                return response.data[0]
+            else:
+                logger.error("No data returned from Supabase insert")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error saving signal to Supabase: {e}")
+            return None
+    
+    def update_signal_outcome(self, signal_id: int, outcome: str, 
+                             close_price: Optional[float] = None,
+                             close_time: Optional[str] = None,
+                             profit_loss: Optional[float] = None) -> bool:
+        """
+        Update signal outcome after trade closes
+        
+        Args:
+            signal_id: The database ID of the signal
+            outcome: 'win', 'loss', or 'breakeven'
+            close_price: The closing price
+            close_time: When the trade closed
+            profit_loss: Profit/loss in pips or currency
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            update_data = {
+                'outcome': outcome,
+                'status': 'closed',
+                'updated_at': datetime.now(UTC).isoformat()
+            }
+            
+            if close_price is not None:
+                update_data['close_price'] = close_price
+            if close_time is not None:
+                update_data['close_time'] = close_time
+            if profit_loss is not None:
+                update_data['profit_loss'] = profit_loss
+            
+            response = self.client.table('signal_history')\
+                .update(update_data)\
+                .eq('id', signal_id)\
+                .execute()
+            
+            if response.data:
+                logger.info(f"Signal {signal_id} updated with outcome: {outcome}")
+                return True
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating signal outcome: {e}")
+            return False
+    
+    def get_recent_signals(self, limit: int = 10) -> List[Dict]:
+        """
+        Retrieve recent signals from database
+        
+        Args:
+            limit: Number of signals to retrieve
+            
+        Returns:
+            List of signal records
+        """
+        try:
+            response = self.client.table('signal_history')\
+                .select('*')\
+                .order('created_at', desc=True)\
+                .limit(limit)\
+                .execute()
+            
+            return response.data if response.data else []
+            
+        except Exception as e:
+            logger.error(f"Error fetching recent signals: {e}")
+            return []
+    
+    def get_performance_stats(self, days: int = 7) -> Dict:
+        """
+        Calculate performance statistics from stored signals
+        
+        Args:
+            days: Number of days to include in statistics
+            
+        Returns:
+            Performance metrics dictionary
+        """
+        try:
+            cutoff_date = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+            
+            response = self.client.table('signal_history')\
+                .select('*')\
+                .gte('created_at', cutoff_date)\
+                .execute()
+            
+            signals = response.data if response.data else []
+            
+            total = len(signals)
+            closed = [s for s in signals if s.get('outcome') in ['win', 'loss', 'breakeven']]
+            wins = len([s for s in closed if s.get('outcome') == 'win'])
+            losses = len([s for s in closed if s.get('outcome') == 'loss'])
+            
+            win_rate = (wins / len(closed)) if closed else 0.0
+            avg_confidence = sum(s.get('confidence', 0) for s in signals) / total if total else 0.0
+            
+            return {
+                'total_signals': total,
+                'closed_signals': len(closed),
+                'active_signals': total - len(closed),
+                'wins': wins,
+                'losses': losses,
+                'win_rate': round(win_rate, 4),
+                'average_confidence': round(avg_confidence, 4),
+                'period_days': days
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating performance stats: {e}")
+            return {}
+
 class XAUUSDSignalGenerator:
     """Main class for generating XAUUSD trading signals in JSON format"""
     
-    def __init__(self, alpha_vantage_key: str = "demo", mode: str = "standard", telegram_token: Optional[str] = None, telegram_chat_id: Optional[str] = None):
+    def __init__(self, alpha_vantage_key: str = "demo", mode: str = "standard", telegram_token: Optional[str] = None, telegram_chat_id: Optional[str] = None, supabase_url: Optional[str] = None, supabase_key: Optional[str] = None):
         self.alpha_vantage_key = alpha_vantage_key
         self.tp_pips = 40
         self.sl_pips = 60
@@ -30,6 +206,18 @@ class XAUUSDSignalGenerator:
         # Telegram (direct-only, no env fallback)
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
+        
+
+        self.supabase_client = None
+        supabase_url = "https://bkbfirqkrwomlxuuvhnz.supabase.co" 
+        supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJrYmZpcnFrcndvbWx4dXV2aG56Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc5NDkwMDMsImV4cCI6MjA3MzUyNTAwM30.PjMUeIMhoS_ZVM0xfueVystaJkJ3hrNj954cuJb1ylE"  # Your anon or service key
+
+        if supabase_url and supabase_key:
+            try:
+                self.supabase_client = create_client(supabase_url, supabase_key)
+                logger.info("Supabase client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Supabase: {e}")
     
     def fetch_market_data(self, symbol: str = "GC=F", interval: str = "5m") -> pd.DataFrame:
         """Fetch OHLC data from Yahoo Finance"""
@@ -495,9 +683,258 @@ class XAUUSDSignalGenerator:
             'multi_timeframe': ', '.join(mtf_reasons) if mtf_reasons else "Multi-timeframe analysis completed"
         }
     
+
+
+    def save_signal_to_supabase(self, signal: Dict, telegram_sent: bool = False) -> Optional[int]:
+        """
+        Save signal to Supabase database
+        
+        Args:
+            signal: The signal dictionary
+            telegram_sent: Whether the signal was successfully sent to Telegram
+        
+        Returns:
+            Signal ID if successful, None otherwise
+        """
+        if not self.supabase_client:
+            logger.warning("Supabase client not initialized - signal not saved to database")
+            return None
+        
+        try:
+            # Only save signals that have a valid direction (actual trading signals)
+            if not signal.get('direction'):
+                logger.info("No trading direction - skipping database save")
+                return None
+            
+            record = {
+                'pair': signal.get('pair', 'XAUUSD'),
+                'signal_time': signal.get('time'),
+                'direction': signal.get('direction'),
+                'entry_price': signal.get('entry_price'),
+                'take_profit': signal.get('take_profit'),
+                'stop_loss': signal.get('stop_loss'),
+                'confidence': signal.get('confidence'),
+                'status': signal.get('status', 'active'),
+                'mode': signal.get('mode', self.mode),
+                'telegram_sent': telegram_sent,
+                'reasoning_technical': signal.get('reasoning', {}).get('technical'),
+                'reasoning_fundamental': signal.get('reasoning', {}).get('fundamental'),
+                'reasoning_mtf': signal.get('reasoning', {}).get('multi_timeframe'),
+                'notes': signal.get('notes'),
+                'created_at': datetime.now(UTC).isoformat()
+            }
+            
+            response = self.supabase_client.table('signal_history').insert(record).execute()
+            
+            if response.data and len(response.data) > 0:
+                signal_id = response.data[0].get('id')
+                logger.info(f"✅ Signal saved to Supabase with ID: {signal_id} (Telegram sent: {telegram_sent})")
+                return signal_id
+            else:
+                logger.warning("Supabase insert returned no data")
+                return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error saving to Supabase: {e}")
+            return None
+    
+    def get_recent_signals_from_db(self, limit: int = 10) -> List[Dict]:
+        """
+        Retrieve recent signals from Supabase
+        
+        Args:
+            limit: Number of signals to retrieve
+            
+        Returns:
+            List of signal records
+        """
+        if not self.supabase_client:
+            logger.warning("Supabase client not initialized")
+            return []
+        
+        try:
+            response = self.supabase_client.table('signal_history')\
+                .select('*')\
+                .order('created_at', desc=True)\
+                .limit(limit)\
+                .execute()
+            
+            return response.data if response.data else []
+            
+        except Exception as e:
+            logger.error(f"Error fetching recent signals: {e}")
+            return []
+    
+    def get_performance_from_db(self, days: int = 7) -> Dict:
+        """
+        Calculate performance statistics from Supabase
+        
+        Args:
+            days: Number of days to include
+            
+        Returns:
+            Performance metrics
+        """
+        if not self.supabase_client:
+            logger.warning("Supabase client not initialized")
+            return {}
+        
+        try:
+            cutoff_date = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+            
+            response = self.supabase_client.table('signal_history')\
+                .select('*')\
+                .gte('created_at', cutoff_date)\
+                .execute()
+            
+            signals = response.data if response.data else []
+            
+            total = len(signals)
+            closed = [s for s in signals if s.get('outcome') in ['win', 'loss', 'breakeven']]
+            wins = len([s for s in closed if s.get('outcome') == 'win'])
+            losses = len([s for s in closed if s.get('outcome') == 'loss'])
+            telegram_sent_count = len([s for s in signals if s.get('telegram_sent')])
+            
+            win_rate = (wins / len(closed)) if closed else 0.0
+            avg_confidence = sum(s.get('confidence', 0) for s in signals) / total if total else 0.0
+            
+            return {
+                'period_days': days,
+                'total_signals': total,
+                'telegram_sent': telegram_sent_count,
+                'closed_signals': len(closed),
+                'active_signals': total - len(closed),
+                'wins': wins,
+                'losses': losses,
+                'win_rate': round(win_rate, 4),
+                'average_confidence': round(avg_confidence, 4)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating performance: {e}")
+            return {}
+    
+    # def generate_signal(self) -> Dict:
+    #     """
+    #     Generate a single trading signal
+    #     Returns: JSON-formatted signal or error
+    #     """
+    #     try:
+    #         # Check for high-impact news
+    #         if self.is_high_impact_news_time():
+    #             return {
+    #                 'status': 'suppressed',
+    #                 'reason': 'High-impact news time detected',
+    #                 'timestamp': datetime.now(UTC).isoformat().replace('+00:00','Z')
+    #             }
+            
+    #         # Fetch multi-timeframe data
+    #         m5 = self.analyze_timeframe('5m')
+    #         m15 = self.analyze_timeframe('15m')
+    #         h1 = self.analyze_timeframe('1h')
+            
+    #         # Validate data
+    #         if not m5.get('valid') or not m15.get('valid'):
+    #             return {
+    #                 'status': 'error',
+    #                 'reason': 'Insufficient market data',
+    #                 'timestamp': datetime.now(UTC).isoformat().replace('+00:00','Z')
+    #             }
+            
+    #         # Fetch sentiment
+    #         sentiment = self.fetch_news_sentiment()
+            
+    #         # Determine direction
+    #         decision = self.determine_direction(m5, m15, h1, sentiment)
+    #         direction = decision.get('direction')
+
+    #         if direction is None:
+    #             return {
+    #                 'status': 'no_signal',
+    #                 'reason': 'No clear trading opportunity detected',
+    #                 'timestamp': datetime.now(UTC).isoformat().replace('+00:00','Z'),
+    #                 'analysis': {
+    #                     'm5_signals': m5['signals'],
+    #                     'm15_trend': m15['trend'],
+    #                     'sentiment': sentiment['label'],
+    #                     'scores': {
+    #                         'bullish': decision.get('bullish_score'),
+    #                         'bearish': decision.get('bearish_score')
+    #                     }
+    #                 }
+    #             }
+            
+    #         # Calculate entry, TP, SL
+    #         entry_price = m5['price']
+            
+    #         tp_pips = self.tp_pips
+    #         sl_pips = self.sl_pips
+    #         # In aggressive mode, use tighter SL/TP by default
+    #         if self.mode == "aggressive":
+    #             tp_pips = int(round(self.tp_pips * 0.75))
+    #             sl_pips = int(round(self.sl_pips * 0.8))
+
+    #         if direction == "BUY":
+    #             take_profit = entry_price + (tp_pips * self.pip_value)
+    #             stop_loss = entry_price - (sl_pips * self.pip_value)
+    #         else:
+    #             take_profit = entry_price - (tp_pips * self.pip_value)
+    #             stop_loss = entry_price + (sl_pips * self.pip_value)
+            
+    #         # Calculate confidence
+    #         confidence = self.calculate_confidence(m5, m15, h1, sentiment, direction)
+            
+    #         # Generate reasoning
+    #         reasoning = self.generate_reasoning(m5, m15, h1, sentiment)
+            
+    #         # Build signal JSON
+    #         signal = {
+    #             'pair': 'XAUUSD',
+    #             'time': datetime.now(UTC).isoformat().replace('+00:00','Z'),
+    #             'direction': direction,
+    #             'entry_price': round(entry_price, 2),
+    #             'take_profit': round(take_profit, 2),
+    #             'stop_loss': round(stop_loss, 2),
+    #             'confidence': confidence,
+    #             'reasoning': reasoning,
+    #             'status': 'active',
+    #             'mode': self.mode
+    #         }
+
+    #         # In aggressive mode, if confidence is low but near threshold, mark as watchlist
+    #         if self.mode == 'aggressive' and confidence < 0.55:
+    #             signal['status'] = 'watchlist'
+    #             signal['notes'] = 'Near-threshold conditions; monitor for confirmation'
+            
+    #         # Add to history
+    #         self.signal_history.append({
+    #             'signal': signal,
+    #             'timestamp': datetime.now(UTC),
+    #             'outcome': None
+    #         })
+
+    #         # Optional Telegram notify
+    #         try:
+    #             if self.telegram_token and self.telegram_chat_id:
+    #                 msg = self._format_signal_text(signal)
+    #                 self.send_telegram_message(msg)
+    #         except Exception as _:
+    #             pass
+            
+    #         return signal
+        
+    #     except Exception as e:
+    #         logger.error(f"Error generating signal: {e}")
+    #         return {
+    #             'status': 'error',
+    #             'reason': str(e),
+    #             'timestamp': datetime.now(UTC).isoformat().replace('+00:00','Z')
+    #         }
+
+
     def generate_signal(self) -> Dict:
         """
-        Generate a single trading signal
+        Generate a single trading signal and save to Supabase if sent to Telegram
         Returns: JSON-formatted signal or error
         """
         try:
@@ -550,7 +987,6 @@ class XAUUSDSignalGenerator:
             
             tp_pips = self.tp_pips
             sl_pips = self.sl_pips
-            # In aggressive mode, use tighter SL/TP by default
             if self.mode == "aggressive":
                 tp_pips = int(round(self.tp_pips * 0.75))
                 sl_pips = int(round(self.sl_pips * 0.8))
@@ -582,7 +1018,6 @@ class XAUUSDSignalGenerator:
                 'mode': self.mode
             }
 
-            # In aggressive mode, if confidence is low but near threshold, mark as watchlist
             if self.mode == 'aggressive' and confidence < 0.55:
                 signal['status'] = 'watchlist'
                 signal['notes'] = 'Near-threshold conditions; monitor for confirmation'
@@ -594,13 +1029,37 @@ class XAUUSDSignalGenerator:
                 'outcome': None
             })
 
-            # Optional Telegram notify
+            # Send to Telegram
+            telegram_sent = False
             try:
                 if self.telegram_token and self.telegram_chat_id:
                     msg = self._format_signal_text(signal)
-                    self.send_telegram_message(msg)
-            except Exception as _:
-                pass
+                    telegram_sent = self.send_telegram_message(msg)
+                    
+                    if telegram_sent:
+                        logger.info("📱 Signal sent to Telegram successfully")
+                    else:
+                        logger.warning("⚠️  Failed to send signal to Telegram")
+                        
+            except Exception as e:
+                logger.error(f"❌ Telegram send error: {e}")
+            
+            # Save to Supabase (only if we have a valid signal with direction)
+            database_id = None
+            try:
+                database_id = self.save_signal_to_supabase(signal, telegram_sent=telegram_sent)
+                if database_id:
+                    signal['database_id'] = database_id
+                    logger.info(f"💾 Signal saved to database with ID: {database_id}")
+                else:
+                    logger.warning("⚠️  Signal not saved to database")
+                    
+            except Exception as e:
+                logger.error(f"❌ Database save error: {e}")
+            
+            # Add status info to signal
+            signal['telegram_sent'] = telegram_sent
+            signal['database_saved'] = database_id is not None
             
             return signal
         
@@ -928,41 +1387,116 @@ def example_api_endpoint():
     # app.run(debug=True)  # Uncomment to run
 
 
+# def main():
+#     parser = argparse.ArgumentParser(description="XAUUSD Signal Generator")
+#     parser.add_argument('--mode', default='standard', choices=['standard', 'aggressive'])
+#     parser.add_argument('--action', default='signal', choices=['signal', 'backtest', 'optimize', 'notify'])
+#     parser.add_argument('--interval', default='5m', choices=['1m','5m','15m','1h'])
+#     parser.add_argument('--symbol', default='GC=F')
+#     parser.add_argument('--telegram-token', default=None, help='Telegram bot token')
+#     parser.add_argument('--telegram-chat-id', default=None, help='Telegram chat/channel id (e.g., -1001234567890)')
+#     parser.add_argument('--supabase-url', default=None, help='Supabase project URL')
+#     parser.add_argument('--supabase-key', default=None, help='Supabase anon or service key')
+#     parser.add_argument('--start', default=None, help='ISO e.g. 2024-01-01T00:00:00Z')
+#     parser.add_argument('--end', default=None, help='ISO e.g. 2024-03-01T00:00:00Z')
+#     args = parser.parse_args()
+
+#     generator = XAUUSDSignalGenerator(
+#         alpha_vantage_key="demo",
+#         mode=args.mode,
+#         telegram_token=(args.telegram_token or "8281174730:AAHRTGP4ZRzloy9m0tNH_jND1kx-GcePNtE"),
+#         telegram_chat_id=(args.telegram_chat_id or "-1002746890711")
+#     )
+
+#     if args.action == 'signal':
+#         signal = generator.generate_signal()
+#         print(json.dumps(signal, indent=2))
+#         return
+
+#     if args.action == 'notify':
+#         signal = generator.generate_signal()
+#         print(json.dumps(signal, indent=2))
+#         return
+
+#     # Backtest/optimize need historical data
+#     if args.start and args.end:
+#         start = datetime.fromisoformat(args.start.replace('Z','+00:00'))
+#         end = datetime.fromisoformat(args.end.replace('Z','+00:00'))
+#     else:
+#         # default: last 14 days for 5m
+#         end = datetime.now(UTC)
+#         start = end - timedelta(days=14)
+
+#     df = generator.fetch_market_data_range(args.symbol, args.interval, start, end)
+
+#     if args.action == 'backtest':
+#         bt = Backtester(generator, interval=args.interval)
+#         perf = bt.run(df)
+#         print(json.dumps(perf, indent=2))
+#         return
+
+#     if args.action == 'optimize':
+#         result = optimize_parameters(generator, df)
+#         print(json.dumps(result, indent=2))
+#         return
+
+
 def main():
     parser = argparse.ArgumentParser(description="XAUUSD Signal Generator")
     parser.add_argument('--mode', default='standard', choices=['standard', 'aggressive'])
-    parser.add_argument('--action', default='signal', choices=['signal', 'backtest', 'optimize', 'notify'])
+    parser.add_argument('--action', default='signal', choices=['signal', 'backtest', 'optimize', 'notify', 'stats'])
     parser.add_argument('--interval', default='5m', choices=['1m','5m','15m','1h'])
     parser.add_argument('--symbol', default='GC=F')
     parser.add_argument('--telegram-token', default=None, help='Telegram bot token')
-    parser.add_argument('--telegram-chat-id', default=None, help='Telegram chat/channel id (e.g., -1001234567890)')
-    parser.add_argument('--start', default=None, help='ISO e.g. 2024-01-01T00:00:00Z')
-    parser.add_argument('--end', default=None, help='ISO e.g. 2024-03-01T00:00:00Z')
+    parser.add_argument('--telegram-chat-id', default=None, help='Telegram chat ID')
+    parser.add_argument('--supabase-url', default=None, help='Supabase project URL')
+    parser.add_argument('--supabase-key', default=None, help='Supabase anon/service key')
+    parser.add_argument('--start', default=None, help='Start date for backtest')
+    parser.add_argument('--end', default=None, help='End date for backtest')
+    parser.add_argument('--stats-days', default=7, type=int, help='Days for stats calculation')
     args = parser.parse_args()
 
+    # Initialize generator with all credentials
     generator = XAUUSDSignalGenerator(
         alpha_vantage_key="demo",
         mode=args.mode,
         telegram_token=(args.telegram_token or "8281174730:AAHRTGP4ZRzloy9m0tNH_jND1kx-GcePNtE"),
-        telegram_chat_id=(args.telegram_chat_id or "-1002746890711")
+        telegram_chat_id=(args.telegram_chat_id or "-1002746890711"),
+        supabase_url=args.supabase_url,
+        supabase_key=args.supabase_key
     )
 
-    if args.action == 'signal':
+    # Generate signal and send to Telegram + save to Supabase
+    if args.action == 'signal' or args.action == 'notify':
         signal = generator.generate_signal()
         print(json.dumps(signal, indent=2))
+        
+        # Print save status
+        if signal.get('database_saved'):
+            print(f"\n✅ Signal saved to Supabase (ID: {signal.get('database_id')})")
+        if signal.get('telegram_sent'):
+            print("✅ Signal sent to Telegram")
+        return
+    
+    # Get performance stats from database
+    if args.action == 'stats':
+        stats = generator.get_performance_from_db(days=args.stats_days)
+        print(json.dumps(stats, indent=2))
+        
+        # Also show recent signals
+        recent = generator.get_recent_signals_from_db(limit=5)
+        print(f"\n📊 Recent {len(recent)} signals:")
+        for sig in recent:
+            print(f"  - {sig.get('direction')} at {sig.get('entry_price')} "
+                  f"(Confidence: {sig.get('confidence')}, "
+                  f"Telegram: {'✅' if sig.get('telegram_sent') else '❌'})")
         return
 
-    if args.action == 'notify':
-        signal = generator.generate_signal()
-        print(json.dumps(signal, indent=2))
-        return
-
-    # Backtest/optimize need historical data
+    # Rest remains the same for backtest/optimize
     if args.start and args.end:
         start = datetime.fromisoformat(args.start.replace('Z','+00:00'))
         end = datetime.fromisoformat(args.end.replace('Z','+00:00'))
     else:
-        # default: last 14 days for 5m
         end = datetime.now(UTC)
         start = end - timedelta(days=14)
 
